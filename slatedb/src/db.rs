@@ -3395,6 +3395,7 @@ mod tests {
             garbage_collector_options: None,
             default_ttl: ttl,
             sst_iterator_configs: SstIteratorConfigs::default(),
+            block_size: 4096,
         }
     }
 }

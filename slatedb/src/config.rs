@@ -52,6 +52,7 @@
 //! l0_sst_size_bytes = 67108864
 //! l0_max_ssts = 8
 //! max_unflushed_bytes = 536870912
+//! block_size = 4096
 //!
 //! [compactor_options]
 //! poll_interval = "5s"
@@ -90,6 +91,7 @@
 //!  "l0_sst_size_bytes": 67108864,
 //!  "l0_max_ssts": 8,
 //!  "max_unflushed_bytes": 536870912,
+//!  "block_size": 4096,
 //!  "compactor_options": {
 //!    "poll_interval": "5s",
 //!    "max_sst_size": 1073741824,
@@ -131,6 +133,7 @@
 //! l0_sst_size_bytes: 67108864
 //! l0_max_ssts: 8
 //! max_unflushed_bytes: 536870912
+//! block_size: 4096
 //! compactor_options:
 //!   poll_interval: '5s'
 //!   max_sst_size: 1073741824
@@ -469,9 +472,14 @@ pub struct Settings {
     ///
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
-    
+
     /// Configuration for SST iterators in different contexts (compaction, reads, WAL replay).
     pub sst_iterator_configs: SstIteratorConfigs,
+
+    /// The size of blocks in SSTable files (in bytes). Larger blocks improve compression
+    /// but increase memory usage and read amplification for point queries.
+    /// Default: 4KB.
+    pub block_size: usize,
 }
 
 // Implement Debug manually for DbOptions.
@@ -501,6 +509,7 @@ impl std::fmt::Debug for Settings {
             .field("filter_bits_per_key", &self.filter_bits_per_key)
             .field("default_ttl", &self.default_ttl)
             .field("sst_iterator_configs", &self.sst_iterator_configs)
+            .field("block_size", &self.block_size)
             .finish()
     }
 }
@@ -661,6 +670,7 @@ impl Default for Settings {
             filter_bits_per_key: 10,
             default_ttl: None,
             sst_iterator_configs: SstIteratorConfigs::default(),
+            block_size: 4096,
         }
     }
 }
@@ -685,7 +695,7 @@ pub struct DbReaderOptions {
 
     #[serde(skip)]
     pub block_cache: Option<Arc<dyn DbCache>>,
-    
+
     /// Options for SST iterators used during read operations.
     pub sst_iterator_options: SstIteratorOptions,
 }
@@ -761,13 +771,13 @@ impl FromStr for CompressionCodec {
 pub struct SstIteratorOptions {
     /// Maximum number of concurrent fetch tasks for reading blocks.
     pub max_fetch_tasks: usize,
-    
+
     /// Number of blocks to fetch in each fetch task.
     pub blocks_to_fetch: usize,
-    
+
     /// Whether to cache blocks after reading them.
     pub cache_blocks: bool,
-    
+
     /// Whether to spawn fetch tasks eagerly or on-demand.
     pub eager_spawn: bool,
 }
@@ -788,7 +798,7 @@ impl Default for SstIteratorOptions {
 pub struct SstIteratorConfigs {
     /// Options for SST iterators during read operations (get/scan).
     pub read: SstIteratorOptions,
-    
+
     /// Options for SST iterators during WAL replay.
     pub wal_replay: SstIteratorOptions,
 }
@@ -833,7 +843,7 @@ pub struct CompactorOptions {
 
     /// The maximum number of concurrent compactions to execute at once
     pub max_concurrent_compactions: usize,
-    
+
     /// Options for SST iterators used during compaction.
     pub sst_iterator_options: SstIteratorOptions,
 }

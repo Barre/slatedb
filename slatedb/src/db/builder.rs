@@ -245,6 +245,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Setup the components
         let stat_registry = Arc::new(StatRegistry::new());
         let sst_format = SsTableFormat {
+            block_size: self.settings.block_size,
             min_filter_keys: self.settings.min_filter_keys,
             filter_bits_per_key: self.settings.filter_bits_per_key,
             compression_codec: self.settings.compression_codec,
