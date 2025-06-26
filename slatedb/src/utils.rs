@@ -216,7 +216,9 @@ fn bytes_into_minimal_vec(bytes: &Bytes) -> Vec<u8> {
 }
 
 pub(crate) fn clamp_allocated_size_bytes(bytes: &Bytes) -> Bytes {
-    bytes_into_minimal_vec(bytes).into()
+    // Temporarily disable clamping to avoid excessive memory allocations
+    // TODO: Implement smarter clamping that checks if reallocation is worth it
+    bytes.clone()
 }
 
 /// Computes the "index key" (lowest bound) for an SST index block, ie a key that's greater
