@@ -60,26 +60,39 @@ impl Ord for MergeIteratorHeapEntry<'_> {
 pub(crate) struct MergeIterator<'a> {
     current: Option<MergeIteratorHeapEntry<'a>>,
     iterators: BinaryHeap<Reverse<MergeIteratorHeapEntry<'a>>>,
+    uninitialized_iterators: Option<Vec<Box<dyn KeyValueIterator + 'a>>>,
 }
 
 impl<'a> MergeIterator<'a> {
     pub(crate) async fn new<T: KeyValueIterator + 'a>(
         iterators: impl IntoIterator<Item = T>,
     ) -> Result<Self, SlateDBError> {
-        let mut heap = BinaryHeap::new();
-        for (index, mut iterator) in iterators.into_iter().enumerate() {
-            if let Some(kv) = iterator.next_entry().await? {
-                heap.push(Reverse(MergeIteratorHeapEntry {
-                    next_kv: kv,
-                    index,
-                    iterator: Box::new(iterator),
-                }));
-            }
-        }
+        let uninit_iters: Vec<Box<dyn KeyValueIterator + 'a>> = iterators
+            .into_iter()
+            .map(|iter| Box::new(iter) as Box<dyn KeyValueIterator + 'a>)
+            .collect();
+        
         Ok(Self {
-            current: heap.pop().map(|r| r.0),
-            iterators: heap,
+            current: None,
+            iterators: BinaryHeap::new(),
+            uninitialized_iterators: Some(uninit_iters),
         })
+    }
+
+    async fn ensure_initialized(&mut self) -> Result<(), SlateDBError> {
+        if let Some(uninit_iters) = self.uninitialized_iterators.take() {
+            for (index, mut iterator) in uninit_iters.into_iter().enumerate() {
+                if let Some(kv) = iterator.next_entry().await? {
+                    self.iterators.push(Reverse(MergeIteratorHeapEntry {
+                        next_kv: kv,
+                        index,
+                        iterator,
+                    }));
+                }
+            }
+            self.current = self.iterators.pop().map(|r| r.0);
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<&RowEntry> {
@@ -87,6 +100,8 @@ impl<'a> MergeIterator<'a> {
     }
 
     async fn advance(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.ensure_initialized().await?;
+        
         if let Some(mut iterator_state) = self.current.take() {
             let current_kv = iterator_state.next_kv;
             if let Some(kv) = iterator_state.iterator.next_entry().await? {
@@ -123,6 +138,8 @@ impl KeyValueIterator for MergeIterator<'_> {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        self.ensure_initialized().await?;
+        
         let mut seek_futures = VecDeque::new();
         if let Some(iterator) = self.current.take() {
             seek_futures.push_back(iterator.seek(next_key))

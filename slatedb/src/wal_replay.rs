@@ -73,12 +73,81 @@ struct ReplayedRow {
     wal_id: u64,
 }
 
+enum LazyWalIterator<'a> {
+    NotLoaded {
+        wal_id: u64,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+    },
+    Loaded(SstIterator<'a>),
+    Failed,
+}
+
+impl<'a> LazyWalIterator<'a> {
+    fn new(wal_id: u64, table_store: Arc<TableStore>, options: SstIteratorOptions) -> Self {
+        LazyWalIterator::NotLoaded {
+            wal_id,
+            table_store,
+            options,
+        }
+    }
+
+    async fn ensure_loaded(&mut self) -> Result<(), SlateDBError> {
+        match self {
+            LazyWalIterator::NotLoaded { wal_id, table_store, options } => {
+                match table_store.open_sst(&SsTableId::Wal(*wal_id)).await {
+                    Ok(sst) => {
+                        match SstIterator::new_owned(.., sst, table_store.clone(), *options).await {
+                            Ok(Some(iter)) => {
+                                *self = LazyWalIterator::Loaded(iter);
+                                Ok(())
+                            }
+                            Ok(None) => {
+                                *self = LazyWalIterator::Failed;
+                                Ok(())
+                            }
+                            Err(e) => {
+                                *self = LazyWalIterator::Failed;
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        *self = LazyWalIterator::Failed;
+                        Err(e)
+                    }
+                }
+            }
+            LazyWalIterator::Loaded(_) | LazyWalIterator::Failed => Ok(()),
+        }
+    }
+
+    fn table_id(&self) -> Option<u64> {
+        match self {
+            LazyWalIterator::NotLoaded { wal_id, .. } => Some(*wal_id),
+            LazyWalIterator::Loaded(iter) => match iter.table_id() {
+                SsTableId::Wal(id) => Some(id),
+                _ => None,
+            },
+            LazyWalIterator::Failed => None,
+        }
+    }
+
+    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.ensure_loaded().await?;
+        match self {
+            LazyWalIterator::Loaded(iter) => iter.next_entry().await,
+            _ => Ok(None),
+        }
+    }
+}
+
 pub(crate) struct WalReplayIterator<'a> {
     options: WalReplayOptions,
     wal_id_range: Range<u64>,
     table_store: Arc<TableStore>,
-    current_iter: IteratorHolder<SstIterator<'a>>,
-    next_iters: VecDeque<JoinHandle<Result<Option<SstIterator<'a>>, SlateDBError>>>,
+    current_iter: IteratorHolder<LazyWalIterator<'a>>,
+    next_iters: VecDeque<JoinHandle<Result<Option<LazyWalIterator<'a>>, SlateDBError>>>,
     overflow_row: Option<ReplayedRow>,
     last_tick: i64,
     last_seq: u64,
@@ -156,9 +225,8 @@ impl WalReplayIterator<'_> {
             wal_id: u64,
             sst_iter_options: SstIteratorOptions,
             table_store: Arc<TableStore>,
-        ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
-            let sst = table_store.open_sst(&SsTableId::Wal(wal_id)).await?;
-            SstIterator::new_owned(.., sst, Arc::clone(&table_store), sst_iter_options).await
+        ) -> Result<Option<LazyWalIterator<'a>>, SlateDBError> {
+            Ok(Some(LazyWalIterator::new(wal_id, table_store, sst_iter_options)))
         }
 
         let handle = task::spawn(load_iter(
@@ -216,7 +284,7 @@ impl WalReplayIterator<'_> {
 
         while !self.current_iter.is_finished() {
             if let Some(sst_iter) = &mut self.current_iter.current_iter {
-                let wal_id = sst_iter.table_id().unwrap_wal_id();
+                let wal_id = sst_iter.table_id().unwrap_or(0);
                 while let Some(row_entry) = sst_iter.next_entry().await? {
                     // skip the entries that are already in the L0 SST.
                     if row_entry.seq <= self.min_seq {

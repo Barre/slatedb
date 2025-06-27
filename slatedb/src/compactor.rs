@@ -172,6 +172,7 @@ struct CompactorEventHandler {
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
+    is_startup: bool,
 }
 
 impl CompactorEventHandler {
@@ -198,6 +199,7 @@ impl CompactorEventHandler {
             rand,
             stats,
             system_clock,
+            is_startup: true,
         })
     }
 
@@ -285,8 +287,15 @@ impl CompactorEventHandler {
     }
 
     async fn maybe_schedule_compactions(&mut self) -> Result<(), SlateDBError> {
+        let available_slots = self.options.max_concurrent_compactions.saturating_sub(self.state.num_compactions());
+        if available_slots == 0 {
+            return Ok(());
+        }
+        
         let compactions = self.scheduler.maybe_schedule_compaction(&self.state);
-        for compaction in compactions.iter() {
+        let compactions_to_submit = compactions.into_iter().take(available_slots);
+        
+        for compaction in compactions_to_submit {
             if self.state.num_compactions() >= self.options.max_concurrent_compactions {
                 info!(
                     "already running {} compactions, which is at the max {}. Won't run compaction {:?}",
@@ -296,7 +305,7 @@ impl CompactorEventHandler {
                 );
                 break;
             }
-            self.submit_compaction(compaction.clone()).await?;
+            self.submit_compaction(compaction).await?;
         }
         Ok(())
     }
@@ -392,7 +401,14 @@ impl CompactorEventHandler {
     async fn refresh_db_state(&mut self) -> Result<(), SlateDBError> {
         self.state
             .merge_remote_manifest(self.manifest.prepare_dirty()?);
-        self.maybe_schedule_compactions().await?;
+        
+        // Skip scheduling compactions on startup to avoid CPU/IO spike
+        // Backpressure will trigger compactions when needed
+        if !self.is_startup {
+            self.maybe_schedule_compactions().await?;
+        } else {
+            self.is_startup = false;
+        }
         Ok(())
     }
 
@@ -877,6 +893,7 @@ mod tests {
         fixture.write_l0().await;
         let compaction = fixture.build_l0_compaction().await;
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         fixture.assert_and_forward_compactions(1);
         let msg = tokio::time::timeout(Duration::from_millis(10), fixture.real_executor_rx.recv())
@@ -910,6 +927,7 @@ mod tests {
         fixture.write_l0().await;
         let compaction = fixture.build_l0_compaction().await;
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         fixture.assert_and_forward_compactions(1);
         let msg = tokio::time::timeout(Duration::from_millis(10), fixture.real_executor_rx.recv())
@@ -953,6 +971,7 @@ mod tests {
         fixture.write_l0().await;
         let compaction = fixture.build_l0_compaction().await;
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         let job = fixture.assert_started_compaction(1).pop().unwrap();
         let msg = WorkerToOrchestratorMsg::CompactionFinished {
@@ -965,6 +984,7 @@ mod tests {
 
         // then:
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         fixture.assert_started_compaction(1);
     }
@@ -976,12 +996,14 @@ mod tests {
         fixture.write_l0().await;
         let compaction = fixture.build_l0_compaction().await;
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         fixture.assert_started_compaction(1);
         fixture.write_l0().await;
         fixture.scheduler.inject_compaction(compaction.clone());
 
         // when:
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
 
         // then:
@@ -995,6 +1017,7 @@ mod tests {
         fixture.write_l0().await;
         let compaction = fixture.build_l0_compaction().await;
         fixture.scheduler.inject_compaction(compaction.clone());
+        fixture.handler.is_startup = false;  // Force scheduling for tests
         fixture.handler.handle_ticker().await;
         fixture.assert_and_forward_compactions(1);
         let msg = tokio::time::timeout(Duration::from_millis(10), fixture.real_executor_rx.recv())

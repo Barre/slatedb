@@ -104,10 +104,10 @@ impl TokioCompactionExecutorInner {
         compaction: &'a CompactionJob,
     ) -> Result<MergeIterator<'a>, SlateDBError> {
         let sst_iter_options = SstIteratorOptions {
-            max_fetch_tasks: 4,
-            blocks_to_fetch: 256,
-            cache_blocks: false, // don't clobber the cache
-            eager_spawn: true,
+            max_fetch_tasks: 1,       // Only 1 task at a time!
+            blocks_to_fetch: 65536,   // Fetch up to 64K blocks (entire SSTs in one read)
+            cache_blocks: false,      // don't clobber the cache
+            eager_spawn: false,       // Don't spawn tasks immediately
         };
 
         let mut l0_iters = VecDeque::new();

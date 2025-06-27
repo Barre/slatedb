@@ -117,7 +117,7 @@ impl IteratorState {
 
 pub(crate) struct SstIterator<'a> {
     view: SstView<'a>,
-    index: Arc<SsTableIndexOwned>,
+    index: Option<Arc<SsTableIndexOwned>>,
     state: IteratorState,
     next_block_idx_to_fetch: usize,
     block_idx_range: Range<usize>,
@@ -134,28 +134,38 @@ impl<'a> SstIterator<'a> {
     ) -> Result<Self, SlateDBError> {
         assert!(options.max_fetch_tasks > 0);
         assert!(options.blocks_to_fetch > 0);
-        let index = table_store.read_index(view.table_as_ref()).await?;
-        let block_idx_range = SstIterator::blocks_covering_view(&index.borrow(), &view);
 
-        let mut iter = Self {
+        let iter = Self {
             view,
-            index,
+            index: None,
             state: IteratorState::new(),
-            next_block_idx_to_fetch: block_idx_range.start,
-            block_idx_range,
+            next_block_idx_to_fetch: 0,
+            block_idx_range: 0..0,
             fetch_tasks: VecDeque::new(),
             table_store,
             options,
         };
 
-        if options.eager_spawn {
-            iter.spawn_fetches();
-        }
         Ok(iter)
     }
 
     pub(crate) fn table_id(&self) -> SsTableId {
         self.view.table_as_ref().id
+    }
+
+    async fn ensure_index_loaded(&mut self) -> Result<(), SlateDBError> {
+        if self.index.is_none() {
+            let index = self.table_store.read_index(self.view.table_as_ref()).await?;
+            let block_idx_range = SstIterator::blocks_covering_view(&index.borrow(), &self.view);
+            self.index = Some(index);
+            self.next_block_idx_to_fetch = block_idx_range.start;
+            self.block_idx_range = block_idx_range;
+
+            if self.options.eager_spawn {
+                self.spawn_fetches();
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn new_owned<T: RangeBounds<Bytes>>(
@@ -251,7 +261,7 @@ impl<'a> SstIterator<'a> {
             let table_store = self.table_store.clone();
             let blocks_start = self.next_block_idx_to_fetch;
             let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
-            let index = self.index.clone();
+            let index = self.index.as_ref().expect("Index must be loaded before spawning fetches").clone();
             let cache_blocks = self.options.cache_blocks;
             self.fetch_tasks
                 .push_back(FetchTask::InFlight(tokio::spawn(async move {
@@ -314,8 +324,10 @@ impl<'a> SstIterator<'a> {
     }
 
     fn stop(&mut self) {
-        let num_blocks = self.index.borrow().block_meta().len();
-        self.next_block_idx_to_fetch = num_blocks;
+        if let Some(index) = &self.index {
+            let num_blocks = index.borrow().block_meta().len();
+            self.next_block_idx_to_fetch = num_blocks;
+        }
         self.state.stop();
     }
 }
@@ -323,6 +335,8 @@ impl<'a> SstIterator<'a> {
 #[async_trait]
 impl KeyValueIterator for SstIterator<'_> {
     async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.ensure_index_loaded().await?;
+        
         while !self.state.is_finished() {
             let next_entry = if let Some(iter) = self.state.current_iter.as_mut() {
                 iter.next_entry().await?
@@ -351,6 +365,9 @@ impl KeyValueIterator for SstIterator<'_> {
                              next_key, self.view.start_key(), self.view.end_key())
             });
         }
+        
+        self.ensure_index_loaded().await?;
+        
         if !self.state.is_finished() {
             if let Some(iter) = self.state.current_iter.as_mut() {
                 iter.seek(next_key).await?;
@@ -359,7 +376,7 @@ impl KeyValueIterator for SstIterator<'_> {
                 }
             }
 
-            let index = self.index.clone();
+            let index = self.index.as_ref().expect("Index should be loaded").clone();
             let block_idx =
                 Self::first_block_with_data_including_or_after_key(&index.borrow(), next_key);
             if block_idx < self.next_block_idx_to_fetch {
