@@ -477,10 +477,9 @@ impl<P: Into<Path>> DbBuilder<P> {
             inner.spawn_memtable_flush_task(manifest, memtable_flush_rx, &tokio_handle);
         let write_task = inner.spawn_write_task(write_rx, &tokio_handle);
 
-        // Not to pollute the cache during compaction or GC
-        let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
+        let background_table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
-                self.main_object_store.clone(),
+                maybe_cached_main_object_store.clone(),
                 self.wal_object_store.clone(),
             ),
             sst_format,
@@ -504,7 +503,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             let cleanup_inner = inner.clone();
             let compactor = Compactor::new(
                 manifest_store.clone(),
-                uncached_table_store.clone(),
+                background_table_store.clone(),
                 compactor_options.clone(),
                 scheduler_supplier,
                 rand.clone(),
@@ -538,7 +537,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 let cleanup_inner = inner.clone();
                 let gc = GarbageCollector::new(
                     manifest_store.clone(),
-                    uncached_table_store.clone(),
+                    background_table_store.clone(),
                     gc_options,
                     inner.stat_registry.clone(),
                     system_clock.clone(),
