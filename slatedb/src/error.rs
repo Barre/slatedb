@@ -130,7 +130,6 @@ pub(crate) enum SlateDBError {
     },
 
     #[error("foyer error")]
-    #[cfg(feature = "foyer")]
     FoyerError(#[from] Arc<foyer::Error>),
 
     #[error("manifest update timeout after {timeout:?}")]
@@ -225,7 +224,6 @@ impl From<object_store::Error> for SlateDBError {
     }
 }
 
-#[cfg(feature = "foyer")]
 impl From<foyer::Error> for SlateDBError {
     fn from(value: foyer::Error) -> Self {
         Self::FoyerError(Arc::new(value))
@@ -418,7 +416,6 @@ impl From<SlateDBError> for Error {
             SlateDBError::ObjectStoreError(err) => {
                 Error::unavailable(msg).with_source(Box::new(err))
             }
-            #[cfg(feature = "foyer")]
             SlateDBError::FoyerError(err) => Error::unavailable(msg).with_source(Box::new(err)),
             SlateDBError::ManifestUpdateTimeout { .. } => Error::unavailable(msg),
 

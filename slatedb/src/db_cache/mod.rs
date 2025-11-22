@@ -4,8 +4,8 @@
 //! cached blocks, index and bloom filters associated with SSTable IDs.
 //!
 //! There are currently two built-in cache implementations:
-//! - [Foyer](crate::db_cache::foyer::FoyerCache): Requires the `foyer` feature flag. (Enabled by default)
-//! - [Moka](crate::db_cache::moka::MokaCache): Requires the `moka` feature flag.
+//! - [Foyer](crate::db_cache::foyer::FoyerCache): The default cache implementation
+//! - [Moka](crate::db_cache::moka::MokaCache): Requires the `moka` feature flag
 //!
 //! ## Usage
 //!
@@ -25,9 +25,7 @@ use crate::{
     block::Block, db_state::SsTableId, filter::BloomFilter, flatbuffer_types::SsTableIndexOwned,
 };
 
-#[cfg(feature = "foyer")]
 pub mod foyer;
-#[cfg(feature = "foyer")]
 pub mod foyer_hybrid;
 #[cfg(feature = "moka")]
 pub mod moka;

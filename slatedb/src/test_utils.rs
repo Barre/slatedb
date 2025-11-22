@@ -14,7 +14,7 @@ use object_store::{
     GetOptions, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions as OS_PutOptions,
     PutPayload, PutResult,
 };
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -146,12 +146,6 @@ impl LogicalClock for TestClock {
     fn now(&self) -> i64 {
         self.ticker.load(Ordering::SeqCst)
     }
-}
-
-pub(crate) fn gen_rand_bytes(n: usize) -> Bytes {
-    let mut rng = rand::rng();
-    let random_bytes: Vec<u8> = (0..n).map(|_| rng.random::<u8>()).collect();
-    Bytes::from(random_bytes)
 }
 
 // it seems that insta still does not allow to customize the snapshot path in insta.yaml,

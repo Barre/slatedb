@@ -1,8 +1,7 @@
-use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{path::Path, Attribute, Attributes, ObjectMeta};
+use object_store::{Attribute, Attributes, ObjectMeta};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Display, ops::Range};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalCacheHead {
@@ -69,32 +68,18 @@ impl From<(&ObjectMeta, &Attributes)> for LocalCacheHead {
     }
 }
 
-#[async_trait]
-pub trait LocalCacheStorage: Send + Sync + std::fmt::Debug + Display + 'static {
-    fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry>;
-
-    async fn start_evictor(&self);
+/// Unified cache key for both parts and heads
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ObjectStoreCacheKey {
+    Part { location: String, part_id: usize },
+    Head { location: String },
 }
 
-#[async_trait]
-pub trait LocalCacheEntry: Send + Sync + std::fmt::Debug + 'static {
-    async fn save_part(&self, part_number: PartID, buf: Bytes) -> object_store::Result<()>;
-
-    async fn read_part(
-        &self,
-        part_number: PartID,
-        range_in_part: Range<usize>,
-    ) -> object_store::Result<Option<Bytes>>;
-
-    /// might be useful on rewriting GET request on the prefetch phase. the cached files are
-    /// expected to be in the same folder, so it'd be expected to be fast without expensive
-    /// globbing.
-    #[cfg(test)]
-    async fn cached_parts(&self) -> object_store::Result<Vec<PartID>>;
-
-    async fn save_head(&self, meta: (&ObjectMeta, &Attributes)) -> object_store::Result<()>;
-
-    async fn read_head(&self) -> object_store::Result<Option<(ObjectMeta, Attributes)>>;
+/// Unified cache value for both parts and heads
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ObjectStoreCacheValue {
+    Part(Bytes),
+    Head(LocalCacheHead),
 }
 
 pub type PartID = usize;

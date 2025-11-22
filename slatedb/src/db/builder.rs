@@ -116,7 +116,7 @@ use crate::batch_write::WriteBatchEventHandler;
 use crate::batch_write::WRITE_BATCH_TASK_NAME;
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::CachedObjectStore;
-use crate::cached_object_store::FsCacheStorage;
+use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
 use crate::clock::DefaultLogicalClock;
 use crate::clock::DefaultSystemClock;
 use crate::clock::LogicalClock;
@@ -364,30 +364,30 @@ impl<P: Into<Path>> DbBuilder<P> {
             ..SsTableFormat::default()
         };
 
-        // Setup object store with optional caching
-        let cached_object_store = match &self.settings.object_store_cache_options.root_folder {
+        let cached_object_store = match &self.settings.object_store_cache_options.storage_path {
             None => None,
-            Some(cache_root_folder) => {
+            Some(storage_path) => {
                 let stats = Arc::new(CachedObjectStoreStats::new(stat_registry.as_ref()));
-                let cache_storage = Arc::new(FsCacheStorage::new(
-                    cache_root_folder.clone(),
-                    self.settings
-                        .object_store_cache_options
-                        .max_cache_size_bytes,
-                    self.settings.object_store_cache_options.scan_interval,
-                    stats.clone(),
-                    system_clock.clone(),
-                    rand.clone(),
-                ));
+
+                let cache = HybridCacheBuilder::new()
+                    .with_name("object_store_cache")
+                    .memory(self.settings.object_store_cache_options.memory_capacity)
+                    .storage(Engine::large())
+                    .with_device_options(
+                        DirectFsDeviceOptions::new(storage_path)
+                            .with_capacity(self.settings.object_store_cache_options.disk_capacity),
+                    )
+                    .build()
+                    .await
+                    .map_err(|e| SlateDBError::FoyerError(Arc::new(e)))?;
 
                 let cached_object_store = CachedObjectStore::new(
                     retrying_main_object_store.clone(),
-                    cache_storage,
+                    Some(cache),
                     self.settings.object_store_cache_options.part_size_bytes,
                     self.settings.object_store_cache_options.cache_puts,
                     stats.clone(),
                 )?;
-                cached_object_store.start_evictor().await;
                 Some(cached_object_store)
             }
         };

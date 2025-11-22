@@ -59,10 +59,10 @@
 //! max_concurrent_compactions = 4
 //!
 //! [object_store_cache_options]
-//! root_folder = "/tmp/slatedb-cache"
-//! max_cache_size_bytes = 17179869184
+//! storage_path = "/tmp/slatedb-cache"
+//! memory_capacity = 268435456
+//! disk_capacity = 17179869184
 //! part_size_bytes = 4194304
-//! scan_interval = "3600s"
 //!
 //! [garbage_collector_options.manifest_options]
 //! interval = "300s"
@@ -97,10 +97,10 @@
 //!  },
 //!  "compression_codec": null,
 //!  "object_store_cache_options": {
-//!    "root_folder": "/tmp/slatedb-cache",
-//!    "max_cache_size_bytes": 17179869184,
-//!    "part_size_bytes": 4194304,
-//!    "scan_interval": "3600s"
+//!    "storage_path": "/tmp/slatedb-cache",
+//!    "memory_capacity": 268435456,
+//!    "disk_capacity": 17179869184,
+//!    "part_size_bytes": 4194304
 //!  },
 //!  "garbage_collector_options": {
 //!    "manifest_options": {
@@ -137,10 +137,10 @@
 //!   max_concurrent_compactions: 4
 //! compression_codec: null
 //! object_store_cache_options:
-//!   root_folder: /tmp/slatedb-cache
-//!   max_cache_size_bytes: 17179869184
+//!   storage_path: /tmp/slatedb-cache
+//!   memory_capacity: 268435456
+//!   disk_capacity: 17179869184
 //!   part_size_bytes: 4194304
-//!   scan_interval: '3600s'
 //! garbage_collector_options:
 //!   manifest_options:
 //!     interval: '300s'
@@ -715,8 +715,8 @@ impl Settings {
     ///
     /// For example, if the prefix is "SLATEDB_" and there's an environment variable named "SLATEDB_DB_FLUSH_INTERVAL",
     /// it would correspond to the `flush_interval` field within the `Settings` struct.
-    /// If there is an environment variable named "SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER",
-    /// it would correspond to the `root_folder` field within the `ObjectStoreCacheOptions` within `Settings`".
+    /// If there is an environment variable named "SLATEDB_OBJECT_STORE_CACHE_OPTIONS.STORAGE_PATH",
+    /// it would correspond to the `storage_path` field within the `ObjectStoreCacheOptions` within `Settings`".
     ///
     /// # Arguments
     ///
@@ -862,15 +862,11 @@ pub(crate) fn default_block_cache() -> Option<Arc<dyn DbCache>> {
             },
         )));
     }
-    #[cfg(feature = "foyer")]
-    {
-        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
-            crate::db_cache::foyer::FoyerCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
-            },
-        )));
-    }
-    None
+    Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
+        crate::db_cache::foyer::FoyerCacheOptions {
+            max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
+        },
+    )))
 }
 
 #[allow(unreachable_code)]
@@ -885,15 +881,11 @@ pub(crate) fn default_meta_cache() -> Option<Arc<dyn DbCache>> {
             },
         )));
     }
-    #[cfg(feature = "foyer")]
-    {
-        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
-            crate::db_cache::foyer::FoyerCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
-            },
-        )));
-    }
-    None
+    Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
+        crate::db_cache::foyer::FoyerCacheOptions {
+            max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
+        },
+    )))
 }
 
 /// The compression algorithm to use for SSTables.
@@ -1070,24 +1062,24 @@ impl Default for GarbageCollectorOptions {
     }
 }
 
-/// Options for the object store cache. This cache is not enabled unless an explicit cache
-/// root folder is set. The object store cache will split an object into align-sized parts
-/// in the local, and save them into the local cache storage.
-///
-/// The local cache default uses file system as storage, it can also be extended to use other
-/// like RocksDB, Redis, etc. in the future.
+/// Options for the object store cache powered by Foyer HybridCache. This cache is not enabled
+/// unless an explicit storage path is set. The object store cache will split objects into
+/// part-sized chunks and cache them using Foyer's hybrid (memory + disk) caching.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ObjectStoreCacheOptions {
-    /// The root folder where the cache files are stored. If not set, the cache will be
+    /// The directory path where Foyer will store its disk cache. If not set, the cache will be
     /// disabled.
-    pub root_folder: Option<std::path::PathBuf>,
+    pub storage_path: Option<std::path::PathBuf>,
 
-    /// The limit of the cache size in bytes, the default value is 16gb on 64 bit systems and
-    /// 4gb on 32 bit systems.
-    pub max_cache_size_bytes: Option<usize>,
+    /// The size of the in-memory cache in bytes. Default is 256MB.
+    pub memory_capacity: usize,
 
-    /// The size of each part file, the part size is expected to be aligned with 1kb,
-    /// its default value is 4mb.
+    /// The size of the disk cache in bytes. Default is 16GB on 64-bit systems and
+    /// 4GB on 32-bit systems.
+    pub disk_capacity: usize,
+
+    /// The size of each cached part in bytes. Must be a multiple of 1KB.
+    /// Default is 4MB. This determines the granularity of cache operations and downloads.
     pub part_size_bytes: usize,
 
     /// Whether to cache PUT operations to disk. When enabled, data written via PUT operations
@@ -1098,30 +1090,20 @@ pub struct ObjectStoreCacheOptions {
     /// the database will load SST files into the cache up to the cache size limit
     /// to warm up the cache for faster access. Default is None (no preloading).
     pub preload_disk_cache_on_startup: Option<PreloadLevel>,
-
-    /// Interval to scan the cache directory to rebuild the in-memory map for evictor.
-    /// The default value is 1 hour. If set to None, the cache directory will be only
-    /// scanned once on start up.
-    #[serde(deserialize_with = "deserialize_option_duration")]
-    #[serde(
-        serialize_with = "serialize_option_duration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub scan_interval: Option<Duration>,
 }
 
 impl Default for ObjectStoreCacheOptions {
     fn default() -> Self {
         Self {
-            root_folder: None,
+            storage_path: None,
+            memory_capacity: 256 * 1024 * 1024, // 256MB
             #[cfg(target_pointer_width = "32")]
-            max_cache_size_bytes: Some(usize::MAX),
+            disk_capacity: 4 * 1024 * 1024 * 1024, // 4GB
             #[cfg(not(target_pointer_width = "32"))]
-            max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),
-            part_size_bytes: 4 * 1024 * 1024,
+            disk_capacity: 16 * 1024 * 1024 * 1024, // 16GB
+            part_size_bytes: 4 * 1024 * 1024,   // 4MB
             cache_puts: false,
             preload_disk_cache_on_startup: None,
-            scan_interval: Some(Duration::from_secs(3600)),
         }
     }
 }
@@ -1168,7 +1150,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("SLATEDB_FLUSH_INTERVAL", "1s");
             jail.set_env(
-                "SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER",
+                "SLATEDB_OBJECT_STORE_CACHE_OPTIONS.STORAGE_PATH",
                 "/tmp/slatedb-root",
             );
 
@@ -1177,7 +1159,7 @@ mod tests {
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
                 Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                options.object_store_cache_options.storage_path
             );
 
             Ok(())
@@ -1193,7 +1175,7 @@ mod tests {
 {
     "flush_interval": "1s",
     "object_store_cache_options": {
-        "root_folder": "/tmp/slatedb-root"
+        "storage_path": "/tmp/slatedb-root"
     }
 }
 "#,
@@ -1205,7 +1187,7 @@ mod tests {
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
                 Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                options.object_store_cache_options.storage_path
             );
             Ok(())
         });
@@ -1219,7 +1201,7 @@ mod tests {
                 r#"
 flush_interval = "1s"
 [object_store_cache_options]
-root_folder = "/tmp/slatedb-root"
+storage_path = "/tmp/slatedb-root"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1229,7 +1211,7 @@ root_folder = "/tmp/slatedb-root"
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
                 Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                options.object_store_cache_options.storage_path
             );
             Ok(())
         });
@@ -1243,7 +1225,7 @@ root_folder = "/tmp/slatedb-root"
                 r#"
 flush_interval: "1s"
 object_store_cache_options:
-    root_folder: "/tmp/slatedb-root"
+    storage_path: "/tmp/slatedb-root"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1253,7 +1235,7 @@ object_store_cache_options:
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
                 Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                options.object_store_cache_options.storage_path
             );
             Ok(())
         });
@@ -1268,7 +1250,7 @@ object_store_cache_options:
                 "SlateDb.yaml",
                 r#"
 object_store_cache_options:
-    root_folder: "/tmp/slatedb-root"
+    storage_path: "/tmp/slatedb-root"
 "#,
             )
             .expect("failed to create db options config file");
@@ -1277,7 +1259,7 @@ object_store_cache_options:
             assert_eq!(Some(Duration::from_secs(1)), options.flush_interval);
             assert_eq!(
                 Some(PathBuf::from("/tmp/slatedb-root")),
-                options.object_store_cache_options.root_folder
+                options.object_store_cache_options.storage_path
             );
             Ok(())
         });

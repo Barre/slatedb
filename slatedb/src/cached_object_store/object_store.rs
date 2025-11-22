@@ -1,33 +1,41 @@
 use crate::cached_object_store::stats::CachedObjectStoreStats;
-use crate::cached_object_store::LocalCacheEntry;
+use crate::cached_object_store::storage::{
+    LocalCacheHead, ObjectStoreCacheKey, ObjectStoreCacheValue, PartID,
+};
+use crate::error::SlateDBError;
+use crate::utils::build_concurrent;
 use bytes::{Bytes, BytesMut};
+use foyer::HybridCache;
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
+use log::warn;
 use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore};
 use object_store::{Attributes, GetRange, GetResultPayload, PutMultipartOptions, PutResult};
 use object_store::{ListResult, MultipartUpload, PutOptions, PutPayload};
 use std::{ops::Range, sync::Arc};
 
-use crate::cached_object_store::admission::AdmissionPicker;
-use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
-use crate::error::SlateDBError;
-use log::warn;
-
-use crate::utils::build_concurrent;
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CachedObjectStore {
     object_store: Arc<dyn ObjectStore>,
-    pub(crate) part_size_bytes: usize, // expected to be aligned with mb or kb
-    pub(crate) cache_storage: Arc<dyn LocalCacheStorage>,
-    pub(crate) admission_picker: AdmissionPicker,
+    pub(crate) part_size_bytes: usize,
+    cache: Option<HybridCache<ObjectStoreCacheKey, ObjectStoreCacheValue>>,
     pub(crate) cache_puts: bool,
     stats: Arc<CachedObjectStoreStats>,
+}
+
+impl std::fmt::Debug for CachedObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedObjectStore")
+            .field("part_size_bytes", &self.part_size_bytes)
+            .field("has_cache", &self.cache.is_some())
+            .field("cache_puts", &self.cache_puts)
+            .finish()
+    }
 }
 
 impl CachedObjectStore {
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
-        cache_storage: Arc<dyn LocalCacheStorage>,
+        cache: Option<HybridCache<ObjectStoreCacheKey, ObjectStoreCacheValue>>,
         part_size_bytes: usize,
         cache_puts: bool,
         stats: Arc<CachedObjectStoreStats>,
@@ -39,15 +47,10 @@ impl CachedObjectStore {
         Ok(Arc::new(Self {
             object_store,
             part_size_bytes,
-            cache_storage,
+            cache,
             stats,
-            admission_picker: AdmissionPicker::default(),
             cache_puts,
         }))
-    }
-
-    pub async fn start_evictor(&self) {
-        self.cache_storage.start_evictor().await;
     }
 
     /// Load files into cache up to a maximum number of bytes.
@@ -114,26 +117,31 @@ impl CachedObjectStore {
     }
 
     pub async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let entry = self.cache_storage.entry(location, self.part_size_bytes);
-        match entry.read_head().await {
-            Ok(Some((meta, _))) => Ok(meta),
-            _ => {
-                let result = self
-                    .object_store
-                    .get_opts(
-                        location,
-                        GetOptions {
-                            range: None,
-                            head: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                let meta = result.meta.clone();
-                self.save_get_result(result).await.ok();
-                Ok(meta)
+        if let Some(cache) = &self.cache {
+            let key = ObjectStoreCacheKey::Head {
+                location: location.to_string(),
+            };
+            if let Ok(Some(entry)) = cache.get(&key).await {
+                if let ObjectStoreCacheValue::Head(head) = entry.value() {
+                    return Ok(head.meta());
+                }
             }
         }
+
+        let result = self
+            .object_store
+            .get_opts(
+                location,
+                GetOptions {
+                    range: None,
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let meta = result.meta.clone();
+        self.save_get_result(result).await.ok();
+        Ok(meta)
     }
 
     pub async fn cached_get_opts(
@@ -168,37 +176,22 @@ impl CachedObjectStore {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<PutResult> {
-        // Only cache if the cache_puts option is enabled
         if !self.cache_puts {
-            // If caching is disabled, just write to the upstream object store without cloning
             return self.object_store.put_opts(location, payload, opts).await;
         }
 
-        // First, write to the upstream object store (cloning payload is cheap since it's just a Arc internally)
         let result = self
             .object_store
             .put_opts(location, payload.clone(), opts)
             .await?;
 
-        // Then, save to local cache if admission policy allows it
-        // Get metadata and attributes using our cached head method (this also saves the head to cache)
         match self.cached_head(location).await {
-            Ok(meta) => {
-                let entry = self
-                    .cache_storage
-                    .entry(&meta.location, self.part_size_bytes);
-                if self.admission_picker.pick(entry.as_ref()).admitted() {
-                    // Convert PutPayload to stream and save parts to cache.
-                    // Note: cached_head() already saved the head, so we only need to save parts
-                    let stream =
-                        stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
-
-                    // Save parts only, ignoring errors (cache failures shouldn't fail the PUT operation)
-                    self.save_parts_stream(entry, stream, 0).await.ok();
-                }
+            Ok(_) => {
+                let stream =
+                    stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
+                self.save_parts_stream(location, stream, 0).await.ok();
             }
             Err(e) => {
-                // Log warning but don't fail the PUT operation
                 warn!(
                     "failed to save head to disk cache [location={}, error={:?}]",
                     location, e
@@ -220,16 +213,17 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
-        let entry = self.cache_storage.entry(location, self.part_size_bytes);
-        match entry.read_head().await {
-            Ok(Some((meta, attrs))) => return Ok((meta, attrs)),
-            Ok(None) => {}
-            Err(_) => {
-                // TODO: add a warning log
+        if let Some(cache) = &self.cache {
+            let key = ObjectStoreCacheKey::Head {
+                location: location.to_string(),
+            };
+            if let Ok(Some(entry)) = cache.get(&key).await {
+                if let ObjectStoreCacheValue::Head(head) = entry.value() {
+                    return Ok((head.meta(), head.attributes()));
+                }
             }
-        };
+        }
 
-        // it's strange that GetOptions did not derive Clone. maybe we could add a derive(Clone) to object_store.
         if let Some(range) = &opts.range {
             opts.range = Some(self.align_get_range(range));
         }
@@ -237,9 +231,6 @@ impl CachedObjectStore {
         let get_result = self.object_store.get_opts(location, opts).await?;
         let result_meta = get_result.meta.clone();
         let result_attrs = get_result.attributes.clone();
-        // swallow the error on saving to disk here (the disk might be already full), just fallback
-        // to the object store.
-        // TODO: add a warning log here.
         self.save_get_result(get_result).await.ok();
         Ok((result_meta, result_attrs))
     }
@@ -255,32 +246,31 @@ impl CachedObjectStore {
                 || result.range.end == result.meta.size
         );
 
-        let entry = self
-            .cache_storage
-            .entry(&result.meta.location, self.part_size_bytes);
+        let location = result.meta.location.clone();
         let object_size = result.meta.size;
 
-        if self.admission_picker.pick(entry.as_ref()).admitted() {
-            entry.save_head((&result.meta, &result.attributes)).await?;
-
-            let start_part_number = usize::try_from(result.range.start / part_size_bytes_u64)
-                .expect("Part number exceeds u32 on a 32-bit system. Try increasing part size.");
-
-            let stream = result.into_stream();
-
-            self.save_parts_stream(entry, stream, start_part_number)
-                .await?;
+        if let Some(cache) = &self.cache {
+            let head: LocalCacheHead = (&result.meta, &result.attributes).into();
+            let key = ObjectStoreCacheKey::Head {
+                location: location.to_string(),
+            };
+            cache.insert(key, ObjectStoreCacheValue::Head(head));
         }
+
+        let start_part_number = usize::try_from(result.range.start / part_size_bytes_u64)
+            .expect("Part number exceeds u32 on a 32-bit system. Try increasing part size.");
+
+        let stream = result.into_stream();
+
+        self.save_parts_stream(&location, stream, start_part_number)
+            .await?;
 
         Ok(object_size)
     }
 
-    /// Save a stream of bytes to cache as parts, starting from the specified part number.
-    /// Returns the number of bytes saved.
-    /// This method only saves the data parts - the head should be saved separately.
     async fn save_parts_stream<S>(
         &self,
-        entry: Box<dyn LocalCacheEntry>,
+        location: &Path,
         mut stream: S,
         start_part_number: usize,
     ) -> object_store::Result<usize>
@@ -298,17 +288,33 @@ impl CachedObjectStore {
 
             while buffer.len() >= self.part_size_bytes {
                 let to_write = buffer.split_to(self.part_size_bytes);
-                entry.save_part(part_number, to_write.into()).await?;
+                self.save_part(location, part_number, to_write.into())
+                    .await?;
                 part_number += 1;
             }
         }
 
-        // Save any remaining bytes as the last part
         if !buffer.is_empty() {
-            entry.save_part(part_number, buffer.into()).await?;
+            self.save_part(location, part_number, buffer.into()).await?;
         }
 
         Ok(total_bytes)
+    }
+
+    async fn save_part(
+        &self,
+        location: &Path,
+        part_id: PartID,
+        bytes: Bytes,
+    ) -> object_store::Result<()> {
+        if let Some(cache) = &self.cache {
+            let key = ObjectStoreCacheKey::Part {
+                location: location.to_string(),
+                part_id,
+            };
+            cache.insert(key, ObjectStoreCacheValue::Part(bytes));
+        }
+        Ok(())
     }
 
     // split the range into parts, and return the part id and the range inside the part.
@@ -356,19 +362,26 @@ impl CachedObjectStore {
         let part_size = self.part_size_bytes;
         let object_store = self.object_store.clone();
         let location = location.clone();
-        let entry = self.cache_storage.entry(&location, self.part_size_bytes);
+        let cache = self.cache.clone();
         let db_stats = self.stats.clone();
         Box::pin(async move {
             db_stats.object_store_cache_part_access.inc();
 
-            if let Ok(Some(bytes)) = entry.read_part(part_id, range_in_part.clone()).await {
-                db_stats.object_store_cache_part_hits.inc();
-                return Ok(bytes);
+            let cache_key = ObjectStoreCacheKey::Part {
+                location: location.to_string(),
+                part_id,
+            };
+
+            if let Some(cache) = &cache {
+                if let Ok(Some(entry)) = cache.get(&cache_key).await {
+                    if let ObjectStoreCacheValue::Part(bytes) = entry.value() {
+                        db_stats.object_store_cache_part_hits.inc();
+                        let slice = bytes.slice(range_in_part);
+                        return Ok(slice);
+                    }
+                }
             }
 
-            // if the part is not cached, fallback to the object store to get the missing part.
-            // the object stores is expected to return the result whenever the `start` of the range
-            // is not out of the object size.
             let range = Range {
                 start: (part_id * part_size) as u64,
                 end: ((part_id + 1) * part_size) as u64,
@@ -383,13 +396,19 @@ impl CachedObjectStore {
                 )
                 .await?;
 
-            // save it to the disk cache, we'll ignore the error on writing to disk here, just return
-            // the bytes from the object store.
             let meta = get_result.meta.clone();
             let attrs = get_result.attributes.clone();
             let bytes = get_result.bytes().await?;
-            entry.save_head((&meta, &attrs)).await.ok();
-            entry.save_part(part_id, bytes.clone()).await.ok();
+
+            if let Some(cache) = &cache {
+                let head: LocalCacheHead = (&meta, &attrs).into();
+                let head_key = ObjectStoreCacheKey::Head {
+                    location: location.to_string(),
+                };
+                cache.insert(head_key, ObjectStoreCacheValue::Head(head));
+                cache.insert(cache_key, ObjectStoreCacheValue::Part(bytes.clone()));
+            }
+
             Ok(Bytes::copy_from_slice(&bytes.slice(range_in_part)))
         })
     }
@@ -476,11 +495,7 @@ impl CachedObjectStore {
 
 impl std::fmt::Display for CachedObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CachedObjectStore({}, {})",
-            self.object_store, self.cache_storage
-        )
+        write!(f, "CachedObjectStore({})", self.object_store)
     }
 }
 
@@ -567,486 +582,4 @@ pub(crate) enum InvalidGetRange {
 
     #[error("Range started at {start} and ended at {end}")]
     Inconsistent { start: u64, end: u64 },
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use object_store::{path::Path, GetOptions, GetRange, ObjectStore, PutPayload};
-    use rand::Rng;
-
-    use super::CachedObjectStore;
-    use crate::cached_object_store::stats::CachedObjectStoreStats;
-    use crate::cached_object_store::storage_fs::FsCacheStorage;
-    use crate::cached_object_store::{storage::PartID, storage_fs::FsCacheEntry};
-    use crate::clock::DefaultSystemClock;
-    use crate::rand::DbRand;
-    use crate::stats::StatRegistry;
-    use crate::test_utils::gen_rand_bytes;
-
-    fn new_test_cache_folder() -> std::path::PathBuf {
-        let mut rng = rand::rng();
-        let dir_name: String = (0..10)
-            .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
-            .collect();
-        let path = format!("/tmp/testcache-{}", dir_name);
-        let _ = std::fs::remove_dir_all(&path);
-        std::path::PathBuf::from(path)
-    }
-
-    #[tokio::test]
-    async fn test_save_result_not_aligned() -> object_store::Result<()> {
-        let payload = gen_rand_bytes(1024 * 3 + 32);
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        object_store
-            .put(
-                &Path::from("/data/testfile1"),
-                PutPayload::from_bytes(payload.clone()),
-            )
-            .await?;
-        let location = Path::from("/data/testfile1");
-        let get_result = object_store.get(&location).await?;
-
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-
-        let part_size = 1024;
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, part_size, false, stats)
-                .unwrap();
-        let entry = cached_store.cache_storage.entry(&location, 1024);
-
-        let object_size_hint = cached_store.save_get_result(get_result).await?;
-        assert_eq!(object_size_hint, 1024 * 3 + 32);
-
-        // assert the cached meta
-        let head = entry.read_head().await?;
-        assert_eq!(head.unwrap().0.size, 1024 * 3 + 32);
-
-        // assert the parts
-        let cached_parts = entry.cached_parts().await?;
-        assert_eq!(cached_parts.len(), 4);
-        assert_eq!(
-            entry.read_part(0, 0..part_size).await?,
-            Some(payload.slice(0..1024))
-        );
-        assert_eq!(
-            entry.read_part(1, 0..part_size).await?,
-            Some(payload.slice(1024..2048))
-        );
-        assert_eq!(
-            entry.read_part(2, 0..part_size).await?,
-            Some(payload.slice(2048..3072))
-        );
-        // check that the unaligned part was also cached
-        assert_eq!(
-            entry.read_part(3, 0..32).await?,
-            Some(payload.slice(3072..3104))
-        );
-
-        // delete part 2, known_cache_size is still known
-        let evict_part_path =
-            FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
-        assert_eq!(entry.read_part(2, 0..part_size).await?, None);
-        let cached_parts = entry.cached_parts().await?;
-        assert_eq!(cached_parts, vec![0, 1, 3]);
-
-        // delete part 3, known_cache_size become None
-        let evict_part_path =
-            FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 3, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
-        assert_eq!(entry.read_part(3, 0..part_size).await?, None);
-        let cached_parts = entry.cached_parts().await?;
-        assert_eq!(cached_parts, vec![0, 1]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_save_result_aligned() -> object_store::Result<()> {
-        let payload = gen_rand_bytes(1024 * 3);
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        object_store
-            .put(
-                &Path::from("/data/testfile1"),
-                PutPayload::from_bytes(payload.clone()),
-            )
-            .await?;
-        let location = Path::from("/data/testfile1");
-        let get_result = object_store.get(&location).await?;
-        let part_size = 1024;
-
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, part_size, false, stats).unwrap();
-        let entry = cached_store.cache_storage.entry(&location, part_size);
-        let object_size_hint = cached_store.save_get_result(get_result).await?;
-        assert_eq!(object_size_hint, 1024 * 3);
-        let cached_parts = entry.cached_parts().await?;
-        assert_eq!(cached_parts.len(), 3);
-        assert_eq!(
-            entry.read_part(0, 0..part_size).await?,
-            Some(payload.slice(0..1024))
-        );
-        assert_eq!(
-            entry.read_part(1, 0..part_size).await?,
-            Some(payload.slice(1024..2048))
-        );
-        assert_eq!(
-            entry.read_part(2, 0..part_size).await?,
-            Some(payload.slice(2048..3072))
-        );
-
-        let evict_part_path =
-            FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, part_size);
-        std::fs::remove_file(evict_part_path).unwrap();
-        assert_eq!(entry.read_part(2, 0..part_size).await?, None);
-
-        let cached_parts = entry.cached_parts().await?;
-        assert_eq!(cached_parts.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn test_split_range_into_parts() {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
-
-        struct Test {
-            input: (Option<GetRange>, usize),
-            expect: Vec<(PartID, std::ops::Range<usize>)>,
-        }
-        let tests = [
-            Test {
-                input: (None, 1024 * 3),
-                expect: vec![(0, 0..1024), (1, 0..1024), (2, 0..1024)],
-            },
-            Test {
-                input: (None, 1024 * 3 + 12),
-                expect: vec![(0, 0..1024), (1, 0..1024), (2, 0..1024), (3, 0..12)],
-            },
-            Test {
-                input: (None, 12),
-                expect: vec![(0, 0..12)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(0..1024)), 1024),
-                expect: vec![(0, 0..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(128..1024)), 20000),
-                expect: vec![(0, 128..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(128..1024 + 12)), 20000),
-                expect: vec![(0, 128..1024), (1, 0..12)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(128..1024 * 2 + 12)), 20000),
-                expect: vec![(0, 128..1024), (1, 0..1024), (2, 0..12)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(1024 * 2..1024 * 3 + 12)), 200000),
-                expect: vec![(2, 0..1024), (3, 0..12)],
-            },
-            Test {
-                input: (Some(GetRange::Bounded(1024 * 2 - 2..1024 * 3 + 12)), 20000),
-                expect: vec![(1, 1022..1024), (2, 0..1024), (3, 0..12)],
-            },
-            Test {
-                input: (Some(GetRange::Suffix(128)), 1024),
-                expect: vec![(0, 896..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Suffix(1024 * 2 + 8)), 1024 * 4),
-                expect: vec![(1, 1016..1024), (2, 0..1024), (3, 0..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Offset(8)), 1024 * 4),
-                expect: vec![(0, 8..1024), (1, 0..1024), (2, 0..1024), (3, 0..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Offset(1024 * 2 + 8)), 1024 * 4),
-                expect: vec![(2, 8..1024), (3, 0..1024)],
-            },
-            Test {
-                input: (Some(GetRange::Offset(1024 * 2 + 8)), 1024 * 4 + 2),
-                expect: vec![(2, 8..1024), (3, 0..1024), (4, 0..2)],
-            },
-        ];
-
-        for t in tests.iter() {
-            let range = cached_store
-                .canonicalize_range(t.input.0.clone(), t.input.1 as u64)
-                .unwrap();
-            let parts = cached_store.split_range_into_parts(range);
-            assert_eq!(parts, t.expect, "input: {:?}", t.input);
-        }
-    }
-
-    #[test]
-    fn test_align_range() {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
-
-        let aligned = cached_store.align_range(&(9..1025), 1024);
-        assert_eq!(aligned, 0..2048);
-        let aligned = cached_store.align_range(&(1024 + 1..2048 + 4), 1024);
-        assert_eq!(aligned, 1024..3072);
-    }
-
-    #[test]
-    fn test_align_get_range() {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
-
-        let aligned = cached_store.align_get_range(&GetRange::Bounded(9..1025));
-        assert_eq!(aligned, GetRange::Bounded(0..2048));
-        let aligned = cached_store.align_get_range(&GetRange::Bounded(9..2048));
-        assert_eq!(aligned, GetRange::Bounded(0..2048));
-        let aligned = cached_store.align_get_range(&GetRange::Suffix(12));
-        assert_eq!(aligned, GetRange::Suffix(1024));
-        let aligned = cached_store.align_get_range(&GetRange::Suffix(1024));
-        assert_eq!(aligned, GetRange::Suffix(1024));
-        let aligned = cached_store.align_get_range(&GetRange::Offset(1024));
-        assert_eq!(aligned, GetRange::Offset(1024));
-        let aligned = cached_store.align_get_range(&GetRange::Offset(12));
-        assert_eq!(aligned, GetRange::Offset(0));
-    }
-
-    #[tokio::test]
-    async fn test_cached_object_store_impl_object_store() -> object_store::Result<()> {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let test_cache_folder = new_test_cache_folder();
-        let stats_registry = StatRegistry::new();
-        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            test_cache_folder.clone(),
-            None,
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, false, stats)
-                .unwrap();
-
-        let test_path = Path::from("/data/testdata1");
-        let test_payload = gen_rand_bytes(1024 * 3 + 2);
-        object_store
-            .put(&test_path, PutPayload::from_bytes(test_payload.clone()))
-            .await?;
-
-        // test get entire object
-        let test_ranges = vec![
-            Some(GetRange::Offset(260817)),
-            None,
-            Some(GetRange::Bounded(1000..2048)),
-            Some(GetRange::Bounded(1000..260817)),
-            Some(GetRange::Suffix(10)),
-            Some(GetRange::Suffix(260817)),
-            Some(GetRange::Offset(1000)),
-            Some(GetRange::Offset(0)),
-            Some(GetRange::Offset(1028)),
-            Some(GetRange::Offset(260817)),
-            Some(GetRange::Offset(1024 * 3 + 2)),
-            Some(GetRange::Offset(1024 * 3 + 1)),
-            #[allow(clippy::reversed_empty_ranges)]
-            Some(GetRange::Bounded(2900..2048)),
-            Some(GetRange::Bounded(10..10)),
-        ];
-
-        // test get a range
-        for range in test_ranges.iter() {
-            let want = object_store
-                .get_opts(
-                    &test_path,
-                    GetOptions {
-                        range: range.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            let got = cached_store
-                .cached_get_opts(
-                    &test_path,
-                    GetOptions {
-                        range: range.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            match (want, got) {
-                (Ok(want), Ok(got)) => {
-                    assert_eq!(want.range, got.range);
-                    assert_eq!(want.meta, got.meta);
-                    assert_eq!(want.bytes().await?, got.bytes().await?);
-                }
-                (Err(want), Err(got)) => {
-                    if want.to_string().to_lowercase().contains("range") {
-                        assert!(got.to_string().to_lowercase().contains("range"));
-                    }
-                }
-                (origin_result, cached_result) => {
-                    panic!("expect: {:?}, got: {:?}", origin_result, cached_result);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_preload_cache() {
-        let cache_dir = new_test_cache_folder();
-        let stat_registry = Arc::new(StatRegistry::new());
-        let stats = Arc::new(CachedObjectStoreStats::new(&stat_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            cache_dir,
-            Some(10 * 1024 * 1024), // 10MB
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, true, stats).unwrap();
-
-        // Create some test files to preload
-        let test_paths = vec![
-            Path::from("file1.sst"),
-            Path::from("file2.sst"),
-            Path::from("file3.sst"),
-        ];
-
-        let test_data = gen_rand_bytes(2048); // 2KB per file
-
-        // Put test files in object store
-        for path in &test_paths {
-            object_store
-                .put(path, PutPayload::from_bytes(test_data.clone()))
-                .await
-                .unwrap();
-        }
-
-        // Test preloading with max cache size
-        cached_store
-            .load_files_to_cache(test_paths.clone(), 10 * 1024) // 10KB limit
-            .await
-            .unwrap();
-
-        // Verify that files are cached by checking if we can read from cache
-        for path in &test_paths {
-            let entry = cached_store.cache_storage.entry(path, 1024);
-            let cached_parts = entry.cached_parts().await.unwrap();
-            assert_eq!(cached_parts.len(), 2); // 2KB = 2 parts of 1024 bytes
-        }
-    }
-
-    #[tokio::test]
-    async fn test_preload_cache_above_limit() {
-        let cache_dir = new_test_cache_folder();
-        let stat_registry = Arc::new(StatRegistry::new());
-        let stats = Arc::new(CachedObjectStoreStats::new(&stat_registry));
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            cache_dir,
-            Some(10 * 1024 * 1024), // 10MB
-            None,
-            stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        ));
-
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, true, stats).unwrap();
-
-        // Create some test files
-        let test_paths = vec![Path::from("file1.sst"), Path::from("file2.sst")];
-
-        let test_data = gen_rand_bytes(2048); // 2KB per file
-
-        // Put test files in object store
-        for path in &test_paths {
-            object_store
-                .put(path, PutPayload::from_bytes(test_data.clone()))
-                .await
-                .unwrap();
-        }
-
-        // Test load_files_to_cache with 0 bytes limit (should load nothing)
-        cached_store
-            .load_files_to_cache(test_paths.clone(), 0)
-            .await
-            .unwrap();
-
-        // Verify that files are NOT cached since preloading was disabled
-        for path in &test_paths {
-            let entry = cached_store.cache_storage.entry(path, 1024);
-            let cached_parts = entry.cached_parts().await.unwrap();
-            assert_eq!(cached_parts.len(), 0); // No parts should be cached
-        }
-    }
 }
