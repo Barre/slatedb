@@ -70,10 +70,11 @@ use crate::compactor_executor::{
     CompactionExecutor, StartCompactionJobArgs, TokioCompactionExecutor,
 };
 use crate::compactor_state::Compaction;
-use crate::config::{CheckpointOptions, CompactorOptions};
+use crate::config::{CheckpointOptions, CompactorOptions, GarbageCollectorOptions};
 use crate::db_state::SortedRun;
 use crate::dispatcher::{MessageFactory, MessageHandler, MessageHandlerExecutor};
 use crate::error::{Error, SlateDBError};
+use crate::garbage_collector::{GarbageCollector, GC_TASK_NAME};
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
 use crate::merge_operator::MergeOperatorType;
 use crate::rand::DbRand;
@@ -203,9 +204,11 @@ pub struct Compactor {
     task_executor: Arc<MessageHandlerExecutor>,
     compactor_runtime: Handle,
     rand: Arc<DbRand>,
+    stat_registry: Arc<StatRegistry>,
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    gc_options: Option<GarbageCollectorOptions>,
 }
 
 impl Compactor {
@@ -220,8 +223,9 @@ impl Compactor {
         system_clock: Arc<dyn SystemClock>,
         closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
         merge_operator: Option<MergeOperatorType>,
+        gc_options: Option<GarbageCollectorOptions>,
     ) -> Self {
-        let stats = Arc::new(CompactionStats::new(stat_registry));
+        let stats = Arc::new(CompactionStats::new(stat_registry.clone()));
         let task_executor = Arc::new(MessageHandlerExecutor::new(
             closed_result.clone(),
             system_clock.clone(),
@@ -234,9 +238,11 @@ impl Compactor {
             task_executor,
             compactor_runtime,
             rand,
+            stat_registry,
             stats,
             system_clock,
             merge_operator,
+            gc_options,
         }
     }
 
@@ -280,6 +286,26 @@ impl Compactor {
                 &Handle::current(),
             )
             .expect("failed to spawn compactor task");
+
+        if let Some(gc_options) = self.gc_options.clone() {
+            let gc = GarbageCollector::new(
+                self.manifest_store.clone(),
+                self.table_store.clone(),
+                gc_options,
+                self.stat_registry.clone(),
+                self.system_clock.clone(),
+            );
+            let (_, gc_rx) = tokio::sync::mpsc::unbounded_channel();
+            self.task_executor
+                .add_handler(
+                    GC_TASK_NAME.to_string(),
+                    Box::new(gc),
+                    gc_rx,
+                    &Handle::current(),
+                )
+                .expect("failed to spawn garbage collector task");
+        }
+
         self.task_executor.monitor_on(&Handle::current())?;
         self.task_executor
             .join_task(COMPACTOR_TASK_NAME)

@@ -762,6 +762,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
     merge_operator: Option<MergeOperatorType>,
+    gc_options: Option<GarbageCollectorOptions>,
 }
 
 #[allow(unused)]
@@ -778,6 +779,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             closed_result: WatchableOnceCell::new(),
             merge_operator: None,
+            gc_options: None,
         }
     }
 
@@ -828,6 +830,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    pub fn with_gc_options(mut self, gc_options: GarbageCollectorOptions) -> Self {
+        self.gc_options = Some(gc_options);
+        self
+    }
+
     /// Builds and returns a Compactor instance.
     pub fn build(self) -> Compactor {
         let path: Path = self.path.into();
@@ -858,6 +865,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock,
             self.closed_result,
             self.merge_operator,
+            self.gc_options,
         )
     }
 }
