@@ -1126,6 +1126,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let sst_format = SsTableFormat {
             filter_policies: self.filter_policies.clone(),
             block_transformer: self.block_transformer.clone(),
+            block_size: self.options.sst_block_size.as_bytes(),
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(

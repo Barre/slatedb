@@ -12,8 +12,8 @@ use crate::format::row;
 use crate::sst_stats::{BlockStats, SstStats};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
-use futures::future::try_join_all;
 use flatbuffers::DefaultAllocator;
+use futures::future::try_join_all;
 use log::warn;
 use std::collections::VecDeque;
 #[cfg(feature = "zlib")]
@@ -934,17 +934,16 @@ impl SsTableFormat {
         let decode_futures: Vec<_> = blocks
             .map(|block| {
                 let block_meta = index.block_meta().get(block);
-                let block_bytes_start =
-                    usize::try_from(block_meta.offset() - start_range).expect(
-                        "attempted to read byte data with size \
+                let block_bytes_start = usize::try_from(block_meta.offset() - start_range).expect(
+                    "attempted to read byte data with size \
                         larger than 32 bits on a 32-bit system",
-                    );
+                );
                 let block_bytes = if block == index.block_meta().len() - 1 {
                     bytes.slice(block_bytes_start..)
                 } else {
                     let next_block_meta = index.block_meta().get(block + 1);
-                    let block_bytes_end =
-                        usize::try_from(next_block_meta.offset() - start_range).expect(
+                    let block_bytes_end = usize::try_from(next_block_meta.offset() - start_range)
+                        .expect(
                             "attempted to read byte data with size \
                             larger than 32 bits on a 32-bit system",
                         );

@@ -247,6 +247,8 @@ struct TokioCompactionTask {
     task: JoinHandle<Result<SortedRun, SlateDBError>>,
 }
 
+const COMPACTION_READ_AHEAD_BYTES: usize = 16 * 1024 * 1024;
+
 pub(crate) struct TokioCompactionExecutorInner {
     options: Arc<CompactorOptions>,
     handle: tokio::runtime::Handle,
@@ -278,7 +280,10 @@ impl TokioCompactionExecutorInner {
         };
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: self.options.max_fetch_tasks,
-            blocks_to_fetch: 256,
+            blocks_to_fetch: self
+                .table_store
+                .bytes_to_blocks(COMPACTION_READ_AHEAD_BYTES)
+                .max(1),
             cache_blocks: false, // don't clobber the cache
             eager_spawn: true,
             order: IterationOrder::Ascending,

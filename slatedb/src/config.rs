@@ -1092,6 +1092,8 @@ pub struct CompactorOptions {
     /// Scheduler-specific options expressed as string key/value pairs.
     #[serde(default)]
     pub scheduler_options: HashMap<String, String>,
+    #[serde(default)]
+    pub sst_block_size: SstBlockSize,
 }
 
 /// Default options for the compactor. Currently, only a
@@ -1107,6 +1109,7 @@ impl Default for CompactorOptions {
             max_concurrent_compactions: 4,
             max_fetch_tasks: 4,
             scheduler_options: HashMap::new(),
+            sst_block_size: SstBlockSize::Block4Kib,
         }
     }
 }
@@ -1124,6 +1127,7 @@ impl std::fmt::Debug for CompactorOptions {
             )
             .field("max_fetch_tasks", &self.max_fetch_tasks)
             .field("scheduler_options", &self.scheduler_options)
+            .field("sst_block_size", &self.sst_block_size)
             .finish()
     }
 }

@@ -6,6 +6,7 @@ use rand::Rng;
 use slatedb::config::{
     CompactorOptions, CompressionCodec, DbReaderOptions, GarbageCollectorDirectoryOptions,
     GarbageCollectorOptions, GarbageCollectorScheduleOptions, SizeTieredCompactionSchedulerOptions,
+    SstBlockSize,
 };
 use slatedb::{DbRand, Settings};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -104,6 +105,7 @@ pub fn build_settings_compactor(rng: &mut impl Rng) -> CompactorOptions {
             include_size_threshold: rng.random_range(2.0..=8.0),
         }
         .into(),
+        sst_block_size: SstBlockSize::Block4Kib,
     }
 }
 
