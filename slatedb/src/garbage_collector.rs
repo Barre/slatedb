@@ -228,6 +228,7 @@ impl GarbageCollector {
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
         gc_filter: Option<Arc<dyn GcFilter>>,
+        staged_ssts: Option<crate::staged_ssts::StagedSsts>,
     ) -> Self {
         let stats = Arc::new(GcStats::new(recorder));
         // The standalone GC lifecycle does not surface a closed result yet, so the
@@ -265,6 +266,7 @@ impl GarbageCollector {
                 stats.clone(),
                 compacted_options,
                 gc_filter.clone(),
+                staged_ssts.clone(),
             )
         });
         let compactions_gc_task = options.compactions_options.map(|compactions_options| {
@@ -1164,6 +1166,7 @@ mod tests {
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1232,6 +1235,7 @@ mod tests {
             &helper,
             Arc::new(DefaultSystemClock::default()),
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1294,6 +1298,7 @@ mod tests {
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
         );
 
@@ -1372,6 +1377,7 @@ mod tests {
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
         );
 
@@ -1828,6 +1834,7 @@ mod tests {
             recorder,
             Arc::new(DefaultSystemClock::default()),
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1903,6 +1910,7 @@ mod tests {
             &recorder,
             Arc::new(DefaultSystemClock::default()),
             None,
+            None,
         );
 
         // Send a WAL GC message. Correct behavior: only WAL GC runs.
@@ -1973,6 +1981,7 @@ mod tests {
             &recorder,
             Arc::new(DefaultSystemClock::default()),
             None,
+            None,
         );
         gc.run_gc_once().await;
 
@@ -2021,6 +2030,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
         );
 
@@ -2074,6 +2084,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
         );
         gc.start().expect("failed to start garbage collector");
@@ -2407,6 +2418,7 @@ mod tests {
             Some(Arc::new(LocationGcFilter {
                 allowed_locations: HashSet::new(),
             })),
+            None,
         );
 
         // Run every directory GC task with candidates present for each task type.
@@ -2506,6 +2518,7 @@ mod tests {
             Some(Arc::new(LocationGcFilter {
                 allowed_locations: HashSet::from([path_resolver.table_path(&allowed_wal_id)]),
             })),
+            None,
         );
 
         // Run WAL GC with a filter that permits only one of the eligible WALs.
@@ -2635,6 +2648,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
         );
 
