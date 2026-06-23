@@ -717,6 +717,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                     manifest_store.clone(),
                     compactions_store.clone(),
                     retrying_main_object_store.clone(),
+                    Some(inner.staged_ssts.clone()),
                 );
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = async_channel::unbounded();
@@ -913,6 +914,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         object_store: Arc<dyn ObjectStore>,
+        staged_ssts: Option<crate::staged_ssts::StagedSsts>,
     ) -> GarbageCollector {
         GarbageCollector::new(
             manifest_store,
@@ -922,6 +924,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.options,
             &self.recorder,
             self.system_clock,
+            staged_ssts,
         )
     }
 
@@ -971,6 +974,8 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.options,
             &self.recorder,
             self.system_clock,
+            // Standalone GC has no co-located writer, so no staged set to honor.
+            None,
         )
     }
 }

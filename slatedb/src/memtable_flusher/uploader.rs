@@ -192,17 +192,38 @@ impl UploadHandler {
             .last_seq()
             .expect("flush of l0 with no entries");
 
-        // Upload all segment SSTs concurrently. `try_join_all` short-circuits
-        // on the first fatal error and drops the remaining futures; sibling
-        // uploads that already landed before the abort are left for the
-        // garbage collector to reclaim, since the worker allocates ids
-        // internally and they are not visible here for explicit cleanup.
-        let segments = futures::future::try_join_all(
+        // Allocate the SST ids and protect them from GC *before* any object is
+        // visible on the store. A staged L0's ULID can fall below the GC
+        // timestamp cutoff (parallel-upload reorder), so without this an L0
+        // could be uploaded, deleted, then republished -> NoSuchKey. The id is
+        // minted here, before the PUT, so protection always precedes visibility
+        // even when the manifest writer is far behind. Protection is dropped
+        // when the memtable is durably published (manifest writer) or below if
+        // the upload fails. See `crate::staged_ssts`.
+        let sst_ids: Vec<SsTableId> = built
+            .iter()
+            .map(|_| SsTableId::Compacted(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref())))
+            .collect();
+        self.db.staged_ssts.add(sst_ids.iter().copied());
+
+        // Upload all segment SSTs concurrently. `try_join_all` short-circuits on
+        // the first fatal error and drops the remaining futures; on abort we
+        // release protection so any sibling SSTs that did land are reclaimable
+        // by GC.
+        let segments = match futures::future::try_join_all(
             built
                 .iter()
-                .map(|sst| self.upload_segment_sst(&job.imm_memtable, sst)),
+                .zip(&sst_ids)
+                .map(|(sst, sst_id)| self.upload_segment_sst(&job.imm_memtable, sst, *sst_id)),
         )
-        .await?;
+        .await
+        {
+            Ok(segments) => segments,
+            Err(e) => {
+                self.db.staged_ssts.remove(sst_ids);
+                return Err(e);
+            }
+        };
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
@@ -219,9 +240,8 @@ impl UploadHandler {
         &self,
         imm_memtable: &Arc<ImmutableMemtable>,
         sst: &EncodedSegmentSst,
+        sst_id: SsTableId,
     ) -> Result<SegmentedSstHandle, SlateDBError> {
-        let sst_id =
-            SsTableId::Compacted(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()));
         let written_bytes = sst.encoded.remaining_len() as u64;
         loop {
             match self

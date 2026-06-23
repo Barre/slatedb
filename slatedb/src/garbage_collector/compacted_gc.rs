@@ -6,6 +6,7 @@ use crate::{
     db_state::SsTableId,
     error::SlateDBError,
     manifest::{store::ManifestStore, Manifest, VersionedManifest},
+    staged_ssts::StagedSsts,
     tablestore::TableStore,
 };
 use chrono::{DateTime, Utc};
@@ -21,6 +22,10 @@ pub(crate) struct CompactedGcTask {
     table_store: Arc<TableStore>,
     stats: Arc<GcStats>,
     compacted_options: GarbageCollectorDirectoryOptions,
+    /// SSTs the in-process writer has staged for publication. `None` for a GC
+    /// with no co-located writer (standalone tool), which falls back to the
+    /// timestamp watermark alone. See [`crate::staged_ssts::StagedSsts`].
+    staged_ssts: Option<StagedSsts>,
 }
 
 impl std::fmt::Debug for CompactedGcTask {
@@ -38,6 +43,7 @@ impl CompactedGcTask {
         table_store: Arc<TableStore>,
         stats: Arc<GcStats>,
         compacted_options: GarbageCollectorDirectoryOptions,
+        staged_ssts: Option<StagedSsts>,
     ) -> Self {
         CompactedGcTask {
             manifest_store,
@@ -45,6 +51,7 @@ impl CompactedGcTask {
             table_store,
             stats,
             compacted_options,
+            staged_ssts,
         }
     }
 
@@ -176,6 +183,18 @@ impl GcTask for CompactedGcTask {
         // manifest) and the compaction low watermark _after_ the SSTs are added to the manifest.
         // This would allow the GC to delete the latest compaction job output SST since they would
         // not be active, and would be older than the low watermark.
+        //
+        // Snapshot the writer's staged (uploaded-but-not-yet-published) SSTs
+        // first, for the same ordering reason: a staged SST captured here is
+        // protected even if it retires into the manifest before we read it, and
+        // any SST staged *after* this snapshot is too recent to be below the
+        // cutoff. This is exact protection that does not rely on ULID ordering,
+        // which the parallel L0 upload pool can invert.
+        let staged_ssts = self
+            .staged_ssts
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
         let state_reader = CompactorStateReader::new(&self.manifest_store, &self.compactions_store);
         let view = state_reader.read_view().await?;
         let compactions = view.compactions;
@@ -184,9 +203,10 @@ impl GcTask for CompactedGcTask {
             manifest,
         } = view.manifest;
         let compaction_low_watermark_dt = Self::compaction_low_watermark_dt(&compactions);
-        let active_ssts = self
+        let mut active_ssts = self
             .list_active_l0_and_compacted_ssts(manifest_id, &manifest)
             .await?;
+        active_ssts.extend(staged_ssts);
         // Don't delete any SSTs that are newer than the configured minimum age.
         let configured_min_age_dt = utc_now - self.compacted_sst_min_age();
         // Don't delete SSTs that are newer than this SST since they're probably an L0 that hasn't yet
@@ -341,6 +361,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
@@ -356,6 +377,117 @@ mod tests {
             .collect();
 
         assert_eq!(remaining, vec![id_within_min_age, id_active_recent]);
+    }
+
+    /// Builds the #453 staged-L0 scenario and runs GC with the given staged set,
+    /// returning the surviving compacted SST ids. A staged L0 (`staged_id`, ULID
+    /// ts=1000) sits on the object store but is absent from the manifest, while a
+    /// newer published L0 (ts=8000) holds `newest_l0` above it and a compaction at
+    /// ts=9000 keeps the low watermark from protecting it. With min_age=5s and
+    /// utc_now=10s the cutoff is 5s, so the staged L0 (ts=1s) is below it.
+    async fn run_staged_l0_gc(staged: Option<StagedSsts>) -> (SsTableId, Vec<SsTableId>) {
+        let main_store = Arc::new(InMemory::new());
+        let object_stores = ObjectStores::new(main_store.clone(), None);
+        let format = SsTableFormat::default();
+        let table_store = Arc::new(TableStore::new(
+            object_stores,
+            format.clone(),
+            Path::from("/root"),
+            None,
+        ));
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from("/root"), main_store.clone()));
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let compactions_store =
+            Arc::new(CompactionsStore::new(&Path::from("/root"), main_store.clone()));
+        let mut stored_compactions = StoredCompactions::create(
+            compactions_store.clone(),
+            stored_manifest.manifest().compactor_epoch,
+        )
+        .await
+        .unwrap();
+        // A compaction at ts=9000 keeps the low watermark above the staged L0.
+        let mut compactions_dirty = stored_compactions.prepare_dirty().unwrap();
+        compactions_dirty.value.insert(Compaction::new(
+            ulid::Ulid::from_parts(9_000, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(0)], 0),
+        ));
+        stored_compactions.update(compactions_dirty).await.unwrap();
+
+        // Staged L0: uploaded with an old ULID, never added to the manifest.
+        let staged_id = SsTableId::Compacted(ulid::Ulid::from_parts(1_000, 0));
+        // Published L0: newer, in the manifest, so newest_l0 = 8000 > staged.
+        let published_id = SsTableId::Compacted(ulid::Ulid::from_parts(8_000, 0));
+        table_store
+            .write_sst(&staged_id, &build_test_sst(&format, 1).await, false)
+            .await
+            .unwrap();
+        let published_handle = table_store
+            .write_sst(&published_id, &build_test_sst(&format, 1).await, false)
+            .await
+            .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty
+            .value
+            .core
+            .tree
+            .l0
+            .push_back(SsTableView::identity(published_handle));
+        stored_manifest.update(dirty).await.unwrap();
+
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let opts = GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age: Duration::from_secs(5),
+        };
+        let stats = Arc::new(GcStats::new(&recorder));
+        let task = CompactedGcTask::new(
+            manifest_store,
+            compactions_store,
+            table_store.clone(),
+            stats,
+            opts,
+            staged,
+        );
+        let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
+        task.collect(utc_now).await.unwrap();
+        let remaining = table_store
+            .list_compacted_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        (staged_id, remaining)
+    }
+
+    /// Control: without the staged set, GC deletes a still-pending L0 whose ULID
+    /// fell below `newest_l0` (the parallel-upload reorder). This is the #453 bug.
+    #[tokio::test]
+    async fn staged_l0_below_newest_l0_is_deleted_without_protection() {
+        let (staged_id, remaining) = run_staged_l0_gc(None).await;
+        assert!(
+            !remaining.contains(&staged_id),
+            "control: an unprotected staged L0 below newest_l0 is deleted (reproduces #453)"
+        );
+    }
+
+    /// Fix: the writer's staged set protects the L0 regardless of its ULID, so GC
+    /// cannot delete an SST that is staged for publication.
+    #[tokio::test]
+    async fn staged_l0_below_newest_l0_is_protected_by_staged_set() {
+        let staged = StagedSsts::default();
+        staged.add([SsTableId::Compacted(ulid::Ulid::from_parts(1_000, 0))]);
+        let (staged_id, remaining) = run_staged_l0_gc(Some(staged)).await;
+        assert!(
+            remaining.contains(&staged_id),
+            "a staged L0 must survive GC while staged for publication"
+        );
     }
 
     #[tokio::test]
@@ -448,6 +580,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
@@ -551,6 +684,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         // Run GC at a fixed time and verify only the SST strictly
@@ -646,6 +780,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();

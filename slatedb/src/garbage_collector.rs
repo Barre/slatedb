@@ -205,6 +205,7 @@ impl GarbageCollector {
         options: GarbageCollectorOptions,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
+        staged_ssts: Option<crate::staged_ssts::StagedSsts>,
     ) -> Self {
         let stats = Arc::new(GcStats::new(recorder));
         let wal_gc_task = options.wal_options.map(|wal_options| {
@@ -222,6 +223,7 @@ impl GarbageCollector {
                 table_store.clone(),
                 stats.clone(),
                 compacted_options,
+                staged_ssts.clone(),
             )
         });
         let compactions_gc_task = options.compactions_options.map(|compactions_options| {
@@ -1439,6 +1441,7 @@ mod tests {
             gc_opts,
             recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1507,6 +1510,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
 
         // Send a WAL GC message. Correct behavior: only WAL GC runs.
@@ -1571,6 +1575,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
         gc.run_gc_once().await;
 
@@ -1611,6 +1616,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
 
         let intervals: Vec<_> = gc
@@ -1657,6 +1663,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
         let (_, rx) = async_channel::unbounded();
         let clock = Arc::new(DefaultSystemClock::default());

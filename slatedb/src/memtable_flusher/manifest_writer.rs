@@ -19,7 +19,7 @@ use super::uploader::UploadedMemtable;
 use crate::checkpoint::CheckpointCreateResult;
 use crate::config::CheckpointOptions;
 use crate::db::DbInner;
-use crate::db_state::SsTableView;
+use crate::db_state::{SsTableId, SsTableView};
 use crate::dispatcher::MessageHandler;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
@@ -288,6 +288,9 @@ impl ManifestWriterHandler {
         &mut self,
         uploaded_memtable: UploadedMemtable,
     ) -> Result<(), SlateDBError> {
+        // GC protection for these SSTs was taken at upload time (see the
+        // uploader), so they are already protected here. It is dropped in
+        // `apply_ready_batch` once the publishing manifest write is durable.
         if self
             .ready
             .insert(uploaded_memtable.first_seq, uploaded_memtable)
@@ -441,13 +444,22 @@ impl ManifestWriterHandler {
             .await
         {
             Ok(checkpoint_results) => {
-                self.finish_ready_batch(
-                    staged_batch,
-                    attached_checkpoints,
-                    checkpoint_results,
-                    through_seq,
-                )
-                .await
+                // The batch is now durably in the manifest, so it no longer
+                // needs staged-GC protection (it is protected as an active SST).
+                let published_ids: Vec<SsTableId> = staged_batch
+                    .iter()
+                    .flat_map(|uploaded| uploaded.segments.iter().map(|s| s.sst_handle.id))
+                    .collect();
+                let result = self
+                    .finish_ready_batch(
+                        staged_batch,
+                        attached_checkpoints,
+                        checkpoint_results,
+                        through_seq,
+                    )
+                    .await;
+                self.db.staged_ssts.remove(published_ids);
+                result
             }
             Err(err) => {
                 self.fail_ready_batch(staged_batch, attached_checkpoints, err.clone())
