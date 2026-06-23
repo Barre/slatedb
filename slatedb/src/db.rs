@@ -119,6 +119,10 @@ pub(crate) struct DbInner {
     /// L0 SSTs. When `None`, the database is the singleton `prefix=""`
     /// segment encoded in the manifest's top-level tree.
     pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// L0 SSTs uploaded but not yet durably published into the manifest. An
+    /// in-process GC consults this to avoid deleting an SST that is staged for
+    /// publication. See [`crate::staged_ssts::StagedSsts`].
+    pub(crate) staged_ssts: crate::staged_ssts::StagedSsts,
 }
 
 impl DbInner {
@@ -208,6 +212,7 @@ impl DbInner {
             snapshot_manager,
             status_manager,
             segment_extractor,
+            staged_ssts: crate::staged_ssts::StagedSsts::default(),
         };
         Ok(db_inner)
     }

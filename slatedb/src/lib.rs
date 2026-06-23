@@ -159,6 +159,7 @@ mod sst_builder;
 mod sst_iter;
 mod sst_reader;
 mod sst_stats;
+mod staged_ssts;
 mod store_provider;
 mod subcompaction;
 mod tablestore;
