@@ -1295,6 +1295,8 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
     fp_registry: Arc<FailPointRegistry>,
+    block_transformer: Option<Arc<dyn BlockTransformer>>,
+    filter_policies: Vec<Arc<dyn FilterPolicy>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1311,6 +1313,8 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             merge_operator: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
+            block_transformer: None,
+            filter_policies: default_filter_policies(),
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1346,6 +1350,31 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         self
     }
 
+    /// Sets the block transformer the worker uses when reading and rewriting
+    /// SSTs during compaction.
+    ///
+    /// Must match the writer's `DbBuilder::with_block_transformer` configuration.
+    /// Without it the worker reads and writes SST blocks untransformed, so a DB
+    /// configured with a transformer (e.g. encryption) cannot offload compaction
+    /// to standalone workers.
+    pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self {
+        self.block_transformer = Some(block_transformer);
+        self
+    }
+
+    /// Sets the filter policies the worker uses when it rewrites SSTs.
+    ///
+    /// Must match the writer's `DbBuilder::with_filter_policies` configuration,
+    /// otherwise compacted SSTs will be written with different (or no) filter
+    /// policies and existing filters may be silently dropped during compaction.
+    ///
+    /// Defaults to `vec![Arc::new(BloomFilterPolicy::new(10))]`. Pass an
+    /// empty vec to disable filters entirely.
+    pub fn with_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
+        self.filter_policies = policies;
+        self
+    }
+
     #[cfg(feature = "compaction_filters")]
     pub fn with_compaction_filter_supplier(
         mut self,
@@ -1362,7 +1391,11 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(self.main_object_store, None),
-            SsTableFormat::default(),
+            SsTableFormat {
+                filter_policies: self.filter_policies.clone(),
+                block_transformer: self.block_transformer.clone(),
+                ..SsTableFormat::default()
+            },
             path,
             None,
             TableStoreKind::Compactor,
