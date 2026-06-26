@@ -622,6 +622,15 @@ impl<P: Into<Path>> DbBuilder<P> {
         )?;
         // The compactor and GC each get their own cacheless store (so background
         // reads do not pollute the foreground cache), tagged with their kind.
+        //
+        // When the caller supplied their own `CompactorBuilder`, the in-process
+        // compactor should read/write through the object store *they* gave it,
+        // so a custom compaction read path (e.g. one that bypasses a prefetch
+        // wrapper used by the foreground read path) actually takes effect
+        // instead of silently reusing the DB's object store. Record that here
+        // before the builder is consumed below; the auto-from-settings path
+        // keeps reusing the DB's store unchanged.
+        let compactor_provided = self.compactor_builder.is_some();
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
                 CompactorBuilder::new(path.clone(), retrying_main_object_store.clone())
@@ -644,9 +653,23 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
             builder = builder.with_fp_registry(self.fp_registry.clone());
 
+            let compactor_main_object_store = if compactor_provided {
+                // Honor the caller-supplied compactor object store, wrapping it
+                // in the compactor's own retry/instrumentation layer.
+                instrumented_retrying_object_store(
+                    builder.main_object_store.clone(),
+                    &recorder,
+                    ObjectStoreComponent::Compactor,
+                    ObjectStoreType::Main,
+                    rand.clone(),
+                    system_clock.clone(),
+                )
+            } else {
+                retrying_main_object_store.clone()
+            };
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
                 ObjectStores::new(
-                    retrying_main_object_store.clone(),
+                    compactor_main_object_store,
                     retrying_wal_object_store.clone(),
                 ),
                 sst_format.clone(),
